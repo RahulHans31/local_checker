@@ -103,7 +103,7 @@ def get_products_from_db():
     try:
         conn = psycopg2.connect(DATABASE_URL) 
         cursor = conn.cursor()
-        # Fetching all required fields, including the new affiliate_link and part_number
+        # Fetching all required fields
         cursor.execute("SELECT name, url, product_id, store_type, affiliate_link, part_number FROM products")
         products = cursor.fetchall()
         conn.close()
@@ -156,7 +156,6 @@ def check_flipkart_product(product, pincode):
         "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N)",
         "X-User-Agent": "Mozilla/5.0 FKUA/msite/0.0.3/msite/Mobile",
         "flipkart_secure": "true",
-        # Ensure Content-Type is set for POST requests
         "Content-Type": "application/json",
         "Accept": "application/json",
     })
@@ -213,8 +212,8 @@ def check_reliance_digital_product(product, pincode):
         "Referer": "https://www.reliancedigital.in/",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
-        "Content-Type": "application/json", # Mandatory for POST
-        "Accept": "application/json", # Mandatory for API response
+        "Content-Type": "application/json",
+        "Accept": "application/json",
     })
 
     payload = {
@@ -241,10 +240,9 @@ def check_reliance_digital_product(product, pincode):
         res.raise_for_status()
         raw = res.json()
         
-        # Extract stock status logic 
         article = raw.get("data", {}).get("articles", [{}])[0]
         error_type = article.get("error", {}).get("type")
-        available = error_type is None # In stock when type is None
+        available = error_type is None
 
         if available:
             print(f"[RD] ✅ {product['name']} available at {pincode}")
@@ -361,15 +359,364 @@ def check_amazon_api(product):
         print(f"[error] Amazon API check failed for {asin}: {e}")
         return None
 
-# --- Placeholder Checkers for other stores (Unicorn, Vijay Sales, Croma, iQOO, Vivo) ---
-# NOTE: The logic for these is complex and relies on specific APIs/scraping. 
-# We'll use a simple placeholder here to keep the core script runnable.
+# --- Croma Checker (API) ---
+def check_croma_product(product, pincode):
+    """Checks stock for a single Croma product at one pincode."""
+    url = "https://api.croma.com/inventory/oms/v2/tms/details-pwa/"
+    headers = DEFAULT_HEADERS.copy()
+    headers.update({
+        "oms-apim-subscription-key": "1131858141634e2abe2efb2b3a2a2a5d",
+        "origin": "https://www.croma.com",
+        "referer": "https://www.croma.com/",
+    })
 
-def check_other_store_product(product, pincode=None):
-    """Placeholder for non-Flipkart/RD stores."""
-    # You would replace this with the full logic from your original check.py for each store
-    # For now, we'll assume they are out of stock.
-    return None 
+    payload = {
+        "promise": {
+            "allocationRuleID": "SYSTEM",
+            "checkInventory": "Y",
+            "organizationCode": "CROMA",
+            "sourcingClassification": "EC",
+            "promiseLines": {
+                "promiseLine": [
+                    {
+                        "fulfillmentType": "HDEL",
+                        "itemID": product["productId"],
+                        "lineId": "1",
+                        "requiredQty": "1",
+                        "shipToAddress": {"zipCode": pincode},
+                        "extn": {"widerStoreFlag": "N"},
+                    }
+                ]
+            },
+        }
+    }
+
+    try:
+        res = requests.post(url, headers=headers, json=payload, proxies=LOCAL_PROXY_SETTINGS, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+
+        lines = (
+            data.get("promise", {})
+            .get("suggestedOption", {})
+            .get("option", {})
+            .get("promiseLines", {})
+            .get("promiseLine", [])
+        )
+
+        if lines:
+            print(f"[CROMA] ✅ {product['name']} deliverable to {pincode}")
+            return f"[{product['name']}]({product['affiliateLink'] or product['url']})\n📍 Pincode: {pincode}"
+
+        print(f"[CROMA] ❌ {product['name']} unavailable at {pincode}")
+    except Exception as e:
+        print(f"[error] Croma check failed for {product['name']}: {e}")
+    return None
+
+# --- iQOO API Checker (FINAL) ---
+def check_iqoo_api(product):
+    """Checks iQOO stock using the direct API endpoint."""
+    product_id = product["productId"] # This is the SPU ID
+    IQOO_API_URL = f"https://mshop.iqoo.com/in/api/product/activityInfo/all/{product_id}"
+    
+    headers = DEFAULT_HEADERS.copy()
+    headers.update({
+        "Referer": f"https://mshop.iqoo.com/in/product/{product_id}",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/5.36"
+    })
+
+    try:
+        res = requests.get(IQOO_API_URL, headers=headers, proxies=LOCAL_PROXY_SETTINGS, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+
+        if data.get("success") != "1" or "data" not in data:
+            print(f"[IQOO_API] ❌ {product['name']} failed. API success was not '1'.")
+            return None
+
+        sku_list = data.get("data", {}).get("activitySkuList", [])
+        is_in_stock = any(sku.get("activityInfo", {}).get("reservableId") == -1 for sku in sku_list)
+
+        if is_in_stock:
+            print(f"[IQOO_API] ✅ {product['name']} is IN STOCK")
+            return (
+                f"[{product['name']}]({product['affiliateLink'] or product['url']})"
+                f"\n💰 Price: N/A (API doesn't show price)"
+            )
+        else:
+            print(f"[IQOO_API] ❌ {product['name']} is Out of Stock.")
+            
+    except Exception as e:
+        print(f"[error] iQOO API check failed for {product_id}: {e}")
+        return None
+
+# --- Vivo API Checker (FINAL) ---
+def check_vivo_api(product):
+    """Checks Vivo stock using the direct API endpoint."""
+    product_id = product["productId"] # This is the SPU ID
+    VIVO_API_URL = f"https://mshop.vivo.com/in/api/product/activityInfo/all/{product_id}"
+    
+    headers = DEFAULT_HEADERS.copy()
+    headers.update({
+        "Referer": f"https://mshop.vivo.com/in/product/{product_id}",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/5.36"
+    })
+
+    try:
+        res = requests.get(VIVO_API_URL, headers=headers, proxies=LOCAL_PROXY_SETTINGS, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+
+        if data.get("success") != "1" or "data" not in data:
+            print(f"[VIVO_API] ❌ {product['name']} failed. API success was not '1'.")
+            return None
+
+        sku_list = data.get("data", {}).get("activitySkuList", [])
+        is_in_stock = any(sku.get("activityInfo", {}).get("reservableId") == -1 for sku in sku_list)
+
+        if is_in_stock:
+            print(f"[VIVO_API] ✅ {product['name']} is IN STOCK")
+            return (
+                f"[{product['name']}]({product['affiliateLink'] or product['url']})"
+                f"\n💰 Price: N/A (API doesn't show price)"
+            )
+        else:
+            print(f"[VIVO_API] ❌ {product['name']} is Out of Stock.")
+            
+    except Exception as e:
+        print(f"[error] Vivo API check failed for {product_id}: {e}")
+        return None
+
+# --- Unicorn Checker (API - FIXED PRODUCTS) ---
+def check_unicorn_store():
+    """Checks stock for a fixed set of iPhone 17 variants at Unicorn Store (hardcoded logic)."""
+    
+    COLOR_VARIANTS = {
+        "Lavender": "313", "Sage": "311", "Mist Blue": "312", 
+        "White": "314", "Black": "315",
+    }
+    STORAGE_256GB_ID = "250"
+    
+    BASE_URL = "https://fe01.beamcommerce.in/get_product_by_option_id"
+    HEADERS = {
+        "accept": "application/json, text/plain, */*",
+        "content-type": "application/json",
+        "customer-id": "unicorn",
+        "origin": "https://shop.unicornstore.in",
+        "referer": "https://shop.unicornstore.in/",
+    }
+    CATEGORY_ID = "456" 
+    FAMILY_ID = "94"
+    GROUP_IDS = "57,58"
+    
+    messages_found = []
+
+    for color_name, color_id in COLOR_VARIANTS.items():
+        variant_name = f"iPhone 17 {color_name} 256GB"
+        payload = {
+            "category_id": CATEGORY_ID,
+            "family_id": FAMILY_ID,
+            "group_ids": GROUP_IDS,
+            "option_ids": f"{color_id},{STORAGE_256GB_ID}"
+        }
+
+        try:
+            res = requests.post(BASE_URL, headers=HEADERS, json=payload, proxies=LOCAL_PROXY_SETTINGS, timeout=10)
+            res.raise_for_status()
+            data = res.json()
+            
+            product_data = data.get("data", {}).get("product", {})
+            quantity = product_data.get("quantity", 0)
+            
+            if int(quantity) > 0:
+                price = f"₹{int(product_data.get('price', 0)):,}" if product_data.get('price') else "N/A"
+                sku = product_data.get("sku", "N/A")
+                product_url = "https://shop.unicornstore.in/iphone-17" 
+                
+                print(f"[UNICORN] ✅ {variant_name} is IN STOCK ({quantity} units)")
+                messages_found.append(
+                    f"[{variant_name} - {sku}]({product_url})"
+                    f"\n💰 Price: {price}, Qty: {quantity}"
+                )
+            else:
+                dispatch_note = product_data.get("custom_column_4", "Out of Stock").strip()
+                print(f"[UNICORN] ❌ {variant_name} unavailable: {dispatch_note}")
+                
+        except Exception as e:
+            print(f"[error] Unicorn check failed for {variant_name}: {e}")
+            
+    found_count = len(messages_found)
+    if found_count > 0:
+        header = f"🔥 *Stock Alert: Unicorn* {STORE_EMOJIS.get('unicorn', '📦')}\n\n"
+        full_message = header + "\n---\n".join(messages_found)
+        thread_id = STORE_TOPIC_IDS.get('unicorn')
+        send_telegram_message(full_message, thread_id=thread_id)
+
+    return {"total": len(COLOR_VARIANTS), "found": found_count}
+
+# --- Vijay Sales Static Checker (FINAL) ---
+def check_vijay_sales_store():
+    """Checks stock for the 5 fixed iPhone 17 variants on Vijay Sales."""
+    PINCODES = PINCODES_TO_CHECK  
+    
+    # Hardcoded products for fixed variants
+    PRODUCTS = {
+        "iPhone 17 Mist Blue 256GB": {
+            "vanNo": "245181",
+            "url": "https://www.vijaysales.com/p/P245179/245181/apple-iphone-17-256gb-storage-mist-blue"
+        },
+        "iPhone 17 Black 256GB": {
+            "vanNo": "245179",
+            "url": "https://www.vijaysales.com/p/P245179/245179/apple-iphone-17-256gb-storage-black"
+        },
+        "iPhone 17 White 256GB": {
+            "vanNo": "245180",
+            "url": "https://www.vijaysales.com/p/P245179/245180/apple-iphone-17-256gb-storage-white"
+        },
+        "iPhone 17 Lavender 256GB": {
+            "vanNo": "245182",
+            "url": "https://www.vijaysales.com/p/P245179/245182/apple-iphone-17-256gb-storage-lavender"
+        },
+        "iPhone 17 Sage 256GB": {
+            "vanNo": "245183",
+            "url": "https://www.vijaysales.com/p/P245179/245183/apple-iphone-17-256gb-storage-sage"
+        }
+    }
+
+    messages_found = []
+    total_variants = len(PRODUCTS)
+
+    for name, info in PRODUCTS.items():
+        vanNo = info["vanNo"]
+        url = info["url"]
+
+        for pin in PINCODES:
+            # Add a random delay before each request to be less aggressive
+            time.sleep(random.uniform(1, 3)) 
+            
+            api_url = (
+                f"https://mdm.vijaysales.com/web/api/oms/check-servicibility/v1"
+                f"?pincode={pin}&vanNo={vanNo}&storeList=true"
+            )
+
+            headers = {
+                "accept": "*/*",
+                "origin": "https://www.vijaysales.com",
+                "referer": "https://www.vijaysales.com/",
+                "user-agent": DEFAULT_HEADERS["User-Agent"]
+            }
+
+            try:
+                res = requests.get(api_url, headers=headers, proxies=LOCAL_PROXY_SETTINGS, timeout=10)
+                data = res.json()
+
+                detail = data.get("data", {}).get(str(vanNo), {})
+                delivery = detail.get("isServiceable", False)
+                pickup_list = detail.get("storePickupList", [])
+                pickup = len(pickup_list) > 0
+
+                if delivery or pickup:
+                    print(f"[VS] ✅ {name} available at {pin}")
+                    msg = (
+                        f"[{name}]({url})\n"
+                        f"📦 Delivery: {'YES' if delivery else 'NO'}, "
+                        f"🏬 Pickup: {'YES' if pickup else 'NO'}\n"
+                        f"📍 Pincode: {pin}"
+                    )
+                    messages_found.append(msg)
+                    break 
+
+                else:
+                    print(f"[VS] ❌ {name} not at {pin}")
+
+            except Exception as e:
+                print(f"[error] Vijay Sales failed for {name}: {e}")
+    
+    found_count = len(messages_found)
+    
+    if found_count > 0:
+        header = f"🔥 *Stock Alert: Vijay Sales* {STORE_EMOJIS.get('vijay_sales', '🛍️')}\n\n"
+        full_message = header + "\n---\n".join(messages_found)
+        thread_id = STORE_TOPIC_IDS.get('vijay_sales')
+        send_telegram_message(full_message, thread_id=thread_id)
+
+    return {"total": total_variants, "found": found_count}
+
+
+# --- iQOO and VIVO Checkers use the same logic as the old implementation for simplicity ---
+
+# --- iQOO API Checker (FINAL) ---
+def check_iqoo_api(product):
+    """Checks iQOO stock using the direct API endpoint."""
+    product_id = product["productId"]
+    IQOO_API_URL = f"https://mshop.iqoo.com/in/api/product/activityInfo/all/{product_id}"
+    
+    headers = DEFAULT_HEADERS.copy()
+    headers.update({
+        "Referer": f"https://mshop.iqoo.com/in/product/{product_id}",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/5.36"
+    })
+
+    try:
+        res = requests.get(IQOO_API_URL, headers=headers, proxies=LOCAL_PROXY_SETTINGS, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        if data.get("success") != "1" or "data" not in data:
+            print(f"[IQOO_API] ❌ {product['name']} failed.")
+            return None
+
+        sku_list = data.get("data", {}).get("activitySkuList", [])
+        is_in_stock = any(sku.get("activityInfo", {}).get("reservableId") == -1 for sku in sku_list)
+
+        if is_in_stock:
+            print(f"[IQOO_API] ✅ {product['name']} is IN STOCK")
+            return (
+                f"[{product['name']}]({product['affiliateLink'] or product['url']})"
+                f"\n💰 Price: N/A (In Stock)"
+            )
+        else:
+            print(f"[IQOO_API] ❌ {product['name']} is Out of Stock.")
+    except Exception as e:
+        print(f"[error] iQOO API check failed for {product_id}: {e}")
+        return None
+
+# --- Vivo API Checker (FINAL) ---
+def check_vivo_api(product):
+    """Checks Vivo stock using the direct API endpoint."""
+    product_id = product["productId"]
+    VIVO_API_URL = f"https://mshop.vivo.com/in/api/product/activityInfo/all/{product_id}"
+    
+    headers = DEFAULT_HEADERS.copy()
+    headers.update({
+        "Referer": f"https://mshop.vivo.com/in/product/{product_id}",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/5.36"
+    })
+
+    try:
+        res = requests.get(VIVO_API_URL, headers=headers, proxies=LOCAL_PROXY_SETTINGS, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+
+        if data.get("success") != "1" or "data" not in data:
+            print(f"[VIVO_API] ❌ {product['name']} failed.")
+            return None
+
+        sku_list = data.get("data", {}).get("activitySkuList", [])
+        is_in_stock = any(sku.get("activityInfo", {}).get("reservableId") == -1 for sku in sku_list)
+
+        if is_in_stock:
+            print(f"[VIVO_API] ✅ {product['name']} is IN STOCK")
+            return (
+                f"[{product['name']}]({product['affiliateLink'] or product['url']})"
+                f"\n💰 Price: N/A (In Stock)"
+            )
+        else:
+            print(f"[VIVO_API] ❌ {product['name']} is Out of Stock.")
+            
+    except Exception as e:
+        print(f"[error] Vivo API check failed for {product_id}: {e}")
+        return None
+
 
 # ==================================
 # 🗺️ STORE CHECKER MAP (FINAL)
@@ -378,30 +725,30 @@ STORE_CHECKERS_MAP = {
     "flipkart": check_flipkart_product,
     "reliance_digital": check_reliance_digital_product,
     "amazon": check_amazon_api,                
-    
-    # Use placeholder for others:
-    "croma": check_other_store_product,
-    "unicorn": check_other_store_product,                      
-    "iqoo": check_other_store_product,                      
-    "vivo": check_other_store_product,
-    "vijay_sales": check_other_store_product,
+    "croma": check_croma_product,
+    "iqoo": check_iqoo_api,                      
+    "vivo": check_vivo_api,
 }
+# Note: unicorn and vijay_sales are handled separately in main_logic.
 
 # ==================================
-# 🚀 CHECKER HELPERS (Adapted from api/check.py)
+# 🚀 CHECKER CORE LOGIC
 # ==================================
 def check_store_products(store_type, products_to_check, pincodes):
-    """Checks all products of a specific store type, running inner checks."""
+    """
+    Checks all products of a specific store type against pincodes (if applicable)
+    and sends a Telegram message if stock is found.
+    """
     checker_func = STORE_CHECKERS_MAP.get(store_type)
     if not checker_func:
         return {"total": 0, "found": 0}
 
     messages_found = []
     
-    # Logic for stores requiring pincode checks
-    if store_type in ["croma", "flipkart", "reliance_digital", "vijay_sales"]:
+    # 1. Logic for stores requiring Pincode checks (Flipkart, RD, Croma)
+    if store_type in ["flipkart", "reliance_digital", "croma"]:
         for product in products_to_check:
-            # Add a small random delay before each request to be less aggressive
+            # Add a small random delay before each product check
             time.sleep(random.uniform(1, 3))
             for pincode in pincodes:
                 message = checker_func(product, pincode)
@@ -409,20 +756,13 @@ def check_store_products(store_type, products_to_check, pincodes):
                     messages_found.append(message)
                     break # Stop checking other pincodes once stock is found
     
-    # Logic for stores that check against a single endpoint (Amazon, iQOO, Vivo, Unicorn)
-    elif store_type in ["amazon", "iqoo", "vivo", "unicorn"]:
+    # 2. Logic for stores that rely on single-endpoint checks (Amazon, iQOO, Vivo)
+    elif store_type in ["amazon", "iqoo", "vivo"]:
         for product in products_to_check:
-             # Amazon is a single product check (no pincode needed)
-            if store_type == "amazon":
-                message = checker_func(product) 
-            # Other single-point API stores need to be integrated fully.
-            # Currently relying on placeholder:
-            else:
-                message = check_other_store_product(product)
-
+            # Amazon check doesn't use pincode, others are single-point API calls
+            message = checker_func(product) 
             if message:
                 messages_found.append(message)
-
 
     found_count = len(messages_found)
     
@@ -437,6 +777,7 @@ def check_store_products(store_type, products_to_check, pincodes):
 
     return {"total": len(products_to_check), "found": found_count}
 
+
 def main_logic():
     start_time = time.time()
     print(f"[info] Starting local stock check with proxy: {LOCAL_PROXY_SETTINGS}")
@@ -446,21 +787,30 @@ def main_logic():
         print("[info] Exiting main logic as no products were loaded.")
         return 
 
-    # Separate products by store type
+    # --- 1. Filter Database Products by Store Type ---
+    db_tracked_stores = ["flipkart", "reliance_digital", "amazon", "croma", "iqoo", "vivo"]
     products_by_store = {
         store_type: [p for p in products if p["storeType"] == store_type]
-        for store_type in STORE_CHECKERS_MAP.keys()
+        for store_type in db_tracked_stores
     }
     
-    # Initialize tracking
-    total_tracked = sum(len(p_list) for p_list in products_by_store.values())
-    tracked_stores = {store: {"total": len(products_by_store.get(store, [])), "found": 0} for store in STORE_CHECKERS_MAP.keys()}
+    # --- 2. Setup Initial Tracking Summary ---
+    tracked_stores = {}
+    for store_type in db_tracked_stores:
+        tracked_stores[store_type] = {"total": len(products_by_store.get(store_type, [])), "found": 0}
 
-    # Run checks concurrently
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    # Add static checkers to the tracking summary
+    tracked_stores["unicorn"] = {"total": 5, "found": 0}
+    tracked_stores["vijay_sales"] = {"total": 5, "found": 0}
+    total_tracked = sum(data['total'] for data in tracked_stores.values())
+
+
+    # --- 3. Run Checks Concurrently ---
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         future_to_store = {}
         
-        for store_type in STORE_CHECKERS_MAP.keys():
+        # A. Submit tasks for DB-tracked stores
+        for store_type in db_tracked_stores:
             if products_by_store.get(store_type):
                 future = executor.submit(
                     check_store_products, 
@@ -470,7 +820,12 @@ def main_logic():
                 )
                 future_to_store[future] = store_type
 
-        # Collect results
+        # B. Submit tasks for statically tracked stores
+        future_to_store[executor.submit(check_unicorn_store)] = "unicorn"
+        future_to_store[executor.submit(check_vijay_sales_store)] = "vijay_sales"
+
+
+        # C. Collect results
         for future in concurrent.futures.as_completed(future_to_store):
             store_type = future_to_store[future]
             try:
@@ -479,7 +834,7 @@ def main_logic():
             except Exception as e:
                 print(f"[ERROR] Concurrent check for {store_type} failed: {e}")
 
-    # Compile final results
+    # --- 4. Compile Final Results ---
     total_found = sum(data['found'] for data in tracked_stores.values())
     duration = round(time.time() - start_time, 2)
     
